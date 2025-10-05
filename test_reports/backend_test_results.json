@@ -1,0 +1,82 @@
+{
+  "summary": {
+    "tests_run": 12,
+    "tests_passed": 10,
+    "success_rate": 83.33333333333334,
+    "timestamp": "2025-10-05T19:38:15.681580"
+  },
+  "detailed_results": [
+    {
+      "test": "API Root",
+      "success": true,
+      "details": "Status: 200, Expected: 200",
+      "timestamp": "2025-10-05T19:37:32.204461"
+    },
+    {
+      "test": "Invalid URL Handling",
+      "success": true,
+      "details": "Status: 400, Expected: 400",
+      "timestamp": "2025-10-05T19:37:32.239923"
+    },
+    {
+      "test": "Empty Text Summarization",
+      "success": true,
+      "details": "Status: 400, Expected: 400",
+      "timestamp": "2025-10-05T19:37:32.278040"
+    },
+    {
+      "test": "Empty Text Enrichment",
+      "success": true,
+      "details": "Status: 400, Expected: 400",
+      "timestamp": "2025-10-05T19:37:32.317330"
+    },
+    {
+      "test": "Text Summarization",
+      "success": true,
+      "details": "Status: 200, Expected: 200",
+      "timestamp": "2025-10-05T19:37:50.456196"
+    },
+    {
+      "test": "Summarization Response Structure",
+      "success": true,
+      "details": "All required fields present",
+      "timestamp": "2025-10-05T19:37:50.456869"
+    },
+    {
+      "test": "Text Enrichment",
+      "success": true,
+      "details": "Status: 200, Expected: 200",
+      "timestamp": "2025-10-05T19:38:15.563638"
+    },
+    {
+      "test": "Enrichment Response Structure",
+      "success": true,
+      "details": "All required fields present",
+      "timestamp": "2025-10-05T19:38:15.564415"
+    },
+    {
+      "test": "Get All Videos",
+      "success": true,
+      "details": "Status: 200, Expected: 200",
+      "timestamp": "2025-10-05T19:38:15.641920"
+    },
+    {
+      "test": "Videos List Structure",
+      "success": true,
+      "details": "Returned 0 videos",
+      "timestamp": "2025-10-05T19:38:15.642527"
+    },
+    {
+      "test": "Video Transcription",
+      "success": false,
+      "details": "Status: 500, Expected: 200",
+      "timestamp": "2025-10-05T19:38:15.680711"
+    },
+    {
+      "test": "Full Workflow",
+      "success": false,
+      "details": "Transcription failed",
+      "timestamp": "2025-10-05T19:38:15.681328"
+    }
+  ]
+}
