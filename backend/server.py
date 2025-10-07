@@ -10,16 +10,32 @@ from typing import List, Optional
 import uuid
 from datetime import datetime, timezone
 import re
+
+# Imports para Gemini
 from youtube_transcript_api import YouTubeTranscriptApi
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from google import genai
+from google.genai import types
+from google.genai import errors as genai_errors 
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+mongo_url = os.environ.get('MONGO_URL')
+if not mongo_url:
+    logging.warning("MONGO_URL not found in .env. Database will not be functional.")
+    client = None
+    db = None
+else:
+    try:
+        client = AsyncIOMotorClient(mongo_url)
+        db_name = os.environ.get('DB_NAME', 'youtube_summary_db')
+        db = client[db_name]
+    except Exception as e:
+        logging.error(f"Failed to connect to MongoDB at startup: {e}")
+        client = None
+        db = None
+
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -28,20 +44,21 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 # LLM Configuration
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
-# Initialize LLM chats for different providers
-def create_llm_chat(provider, model, system_message):
-    """Create LLM chat instance with error handling"""
-    try:
-        return LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"{provider}-session-{uuid.uuid4()}",
-            system_message=system_message
-        ).with_model(provider, model)
-    except Exception as e:
-        logging.error(f"Error creating {provider} chat: {e}")
-        return None
+# Inicializa o cliente Gemini globalmente
+try:
+    if GEMINI_API_KEY:
+        # Note: A biblioteca google-genai pode usar a variável GEMINI_API_KEY do ambiente automaticamente.
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        gemini_client = None
+        logging.warning("GEMINI_API_KEY não configurada. A integração com IA pode falhar.")
+
+except Exception as e:
+    logging.error(f"Erro ao inicializar o cliente Gemini: {e}")
+    gemini_client = None
+
 
 # Define Models
 class VideoRequest(BaseModel):
@@ -101,7 +118,10 @@ async def get_youtube_transcript(video_id: str) -> str:
         raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição: {str(e)}")
 
 async def process_with_ai(text: str, task: str) -> str:
-    """Process text with AI using multiple provider fallback"""
+    """Process text with AI using Google Generative AI (Gemini) direct client"""
+    
+    if gemini_client is None:
+        raise HTTPException(status_code=500, detail="Cliente Gemini não inicializado. Verifique a GEMINI_API_KEY.")
     
     system_messages = {
         "summarize": "Você é um especialista em resumir conteúdo de vídeos do YouTube. Crie resumos claros, estruturados e informativos em português brasileiro.",
@@ -150,26 +170,32 @@ Analise o seguinte texto e crie uma versão aprimorada e enriquecida:
 ## 📈 Próximos Passos
 """
     }
+    
+    try:
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[
+                prompts[task]
+            ],
+            config=types.GenerateContentConfig(
+                system_instruction=system_messages[task]
+            )
+        )
+        
+        # Verifica se o conteúdo foi bloqueado
+        if response.candidates and response.candidates[0].finish_reason.name == 'SAFETY':
+             return "O conteúdo da transcrição foi bloqueado pelas políticas de segurança do modelo Gemini."
+             
+        return response.text
+        
+    except genai_errors.APIError as e:
+        logging.error(f"Erro de API com Gemini: {e}")
+        # A API Error geralmente significa chave inválida ou erro de cota
+        raise HTTPException(status_code=500, detail="Erro de API com Gemini. Verifique se a GEMINI_API_KEY é válida ou se a cota foi excedida (grátis).")
+    except Exception as e:
+        logging.error(f"Erro ao processar com Gemini: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao processar com Gemini: {str(e)}")
 
-    # Provider configurations with fallback order
-    providers = [
-        ("gemini", "gemini-2.5-flash"),
-        ("openai", "gpt-4o"),
-        ("anthropic", "claude-3-5-sonnet-20241022")
-    ]
-    
-    for provider, model in providers:
-        try:
-            chat = create_llm_chat(provider, model, system_messages[task])
-            if chat:
-                user_message = UserMessage(text=prompts[task])
-                response = await chat.send_message(user_message)
-                return response
-        except Exception as e:
-            logging.error(f"Error with {provider}: {e}")
-            continue
-    
-    raise HTTPException(status_code=500, detail="Todos os provedores de IA falharam")
 
 # API Routes
 @api_router.get("/")
@@ -189,13 +215,19 @@ async def transcribe_video(request: VideoRequest):
         )
         
         # Save to database
-        await db.videos.insert_one(video_response.dict())
-        
+        # CORREÇÃO CRÍTICA: Mudança de 'if db:' para 'if db is not None:'
+        if db is not None:
+            await db.videos.insert_one(video_response.dict())
+        else:
+            logging.warning("Database client is not available. Skipping save operation.")
+            
         return video_response
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # Erro interno, pode ser do DB
+        logging.error(f"Erro interno no /transcribe: {e}")
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 @api_router.post("/videos/summarize", response_model=ProcessResult)
@@ -208,7 +240,9 @@ async def summarize_text(request: TranscriptRequest):
         summary = await process_with_ai(request.text, "summarize")
         
         result = ProcessResult(result=summary)
-        await db.summaries.insert_one(result.dict())
+        # CORREÇÃO CRÍTICA: Mudança de 'if db:' para 'if db is not None:'
+        if db is not None:
+            await db.summaries.insert_one(result.dict())
         
         return result
         
@@ -227,7 +261,9 @@ async def enrich_text(request: TranscriptRequest):
         enrichment = await process_with_ai(request.text, "enrich")
         
         result = ProcessResult(result=enrichment)
-        await db.enrichments.insert_one(result.dict())
+        # CORREÇÃO CRÍTICA: Mudança de 'if db:' para 'if db is not None:'
+        if db is not None:
+            await db.enrichments.insert_one(result.dict())
         
         return result
         
@@ -239,6 +275,10 @@ async def enrich_text(request: TranscriptRequest):
 @api_router.get("/videos", response_model=List[VideoResponse])
 async def get_videos():
     """Get all processed videos"""
+    # CORREÇÃO CRÍTICA: Mudança de 'if not db:' para 'if db is None:'
+    if db is None:
+        raise HTTPException(status_code=500, detail="Conexão com o banco de dados indisponível.")
+    
     videos = await db.videos.find().to_list(100)
     return [VideoResponse(**video) for video in videos]
 
@@ -262,4 +302,5 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client:
+        client.close()

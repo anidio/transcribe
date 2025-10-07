@@ -5,8 +5,9 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
-import { Loader2, Youtube, Sparkles, FileText, Zap } from "lucide-react";
+import { Loader2, Youtube, Sparkles, FileText, Zap, Instagram } from "lucide-react";
 import { toast } from "sonner";
+import Footer from "./components/ui/Footer.jsx";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -91,6 +92,8 @@ function App() {
   const formatMarkdown = (text) => {
     if (!text) return "";
     
+    // NOTA: Esta função só é usada nas áreas de resultado (Summary/Enrichment)
+    // As tags Markdown continuam sendo usadas aqui para formatar o texto da IA
     return text
       .replace(/## (.*)/g, '<h2 class="text-xl font-bold text-cyan-400 mb-3 mt-6">$1</h2>')
       .replace(/### (.*)/g, '<h3 class="text-lg font-semibold text-pink-400 mb-2 mt-4">$1</h3>')
@@ -119,8 +122,12 @@ function App() {
               YT AI Processor
             </h1>
           </div>
+          
+          {/* Parágrafo de SEO Otimizado (AGORA USANDO TAGS <strong> DIRETAMENTE) */}
           <p className="text-xl text-gray-300 max-w-2xl mx-auto">
-            Transforme vídeos do YouTube em conteúdo estruturado com IA avançada
+            Transforme vídeos do YouTube em conteúdo estruturado com IA avançada. Use nossa ferramenta 
+            <strong className="text-cyan-400"> Grátis</strong> para <strong className="text-pink-400">Transcrever</strong>, 
+            <strong className="text-pink-400"> Resumir</strong> e <strong className="text-pink-400">Otimizar</strong> qualquer vídeo em português!
           </p>
         </div>
 
@@ -275,6 +282,10 @@ function App() {
           </div>
         </div>
       </div>
+      
+      {/* NOVO: Componente Footer Inserido aqui */}
+      <Footer /> 
+
     </div>
   );
 }
