@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request # Adicionado Request
+from fastapi import FastAPI, APIRouter, HTTPException, Request 
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,7 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import uuid
-from datetime import datetime, timezone, timedelta # Adicionado timedelta
+from datetime import datetime, timezone, timedelta 
 import re
 
 # Imports para Gemini
@@ -85,13 +85,11 @@ class ProcessResult(BaseModel):
     result: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-# --- Lógica de Rate Limiting ---
-
+# --- Lógica de Rate Limiting (Não alterada) ---
 async def check_rate_limit(collection: AgnosticCollection, client_id: str):
     """Verifica e atualiza o limite de requisições por IP na última hora."""
     
     if db is None:
-        # Se o DB estiver desligado, pulamos o limite, mas a cota da API ainda existe
         logging.warning("DB is None. Skipping rate limit check.")
         return
     
@@ -122,11 +120,6 @@ async def check_rate_limit(collection: AgnosticCollection, client_id: str):
         "timestamp": current_time,
         "type": "ai_call"
     })
-    # 5. Indexação (Opcional, mas melhora o desempenho)
-    # collection.create_index([("client_id", 1), ("timestamp", 1)], background=True)
-
-
-# --- Funções do Núcleo da Aplicação ---
 
 def extract_video_id(url: str) -> str:
     """Extract YouTube video ID from URL"""
@@ -146,32 +139,23 @@ def extract_video_id(url: str) -> str:
 async def get_youtube_transcript(video_id: str) -> str:
     """Get YouTube transcript with fallback languages and proxy support."""
     
-    # --- NOVO: Lógica de Proxy ---
+    # --- Lógica de Proxy ---
     proxy_url = os.environ.get('TRANSCRIPTION_PROXY')
     proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
     # --- Fim Lógica de Proxy ---
 
     try:
-        api = YouTubeTranscriptApi()
-        
-        # Try Portuguese first, then English
-        for lang_codes in [['pt'], ['en'], ['pt-BR'], ['en-US']]:
-            try:
-                # Passa o argumento proxies para a função fetch
-                transcript = api.fetch(video_id, languages=lang_codes, proxies=proxies)
-                transcript_text = ' '.join([entry.text for entry in transcript])
-                return transcript_text
-            except:
-                continue
-                
-        # If no specific language works, try default (English)
-        # Passa o argumento proxies para a função fetch
-        transcript = api.fetch(video_id, languages=['en'], proxies=proxies)
-        transcript_text = ' '.join([entry.text for entry in transcript])
+        # Tenta buscar PT e EN (o método 'get_transcript' é estático)
+        transcript_list = YouTubeTranscriptApi.get_transcript(
+            video_id, 
+            languages=['pt', 'en', 'pt-BR', 'en-US'],
+            proxies=proxies # Agora o método estático aceita proxies
+        )
+        transcript_text = ' '.join([entry['text'] for entry in transcript_list])
         return transcript_text
         
     except Exception as e:
-        # Erro de bloqueio de IP da Cloud geralmente é capturado aqui
+        # Erro de bloqueio de IP da Cloud ou falha no proxy
         logging.error(f"Erro na transcrição (possível bloqueio de IP): {e}")
         raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição (Bloqueio de IP da Cloud?): {str(e)}")
 
@@ -288,7 +272,7 @@ async def transcribe_video(request: VideoRequest):
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 @api_router.post("/videos/summarize", response_model=ProcessResult)
-async def summarize_text(request: TranscriptRequest, request_info: Request): # Adicionado request_info: Request
+async def summarize_text(request: TranscriptRequest, request_info: Request): 
     """Summarize transcript text"""
     
     # --- Lógica de Rate Limiting ---
@@ -316,13 +300,13 @@ async def summarize_text(request: TranscriptRequest, request_info: Request): # A
         raise HTTPException(status_code=500, detail=f"Erro ao processar resumo: {str(e)}")
 
 @api_router.post("/videos/enrich", response_model=ProcessResult)  
-async def enrich_text(request: TranscriptRequest, request_info: Request): # Adicionado request_info: Request
+async def enrich_text(request: TranscriptRequest, request_info: Request): 
     """Enrich and enhance transcript text"""
     
     # --- Lógica de Rate Limiting ---
     client_ip, _ = get_client_ip(request_info.headers)
     if client_ip:
-        await check_rate_limit(db.rate_limits, client_ip)
+        await check_rate_limit(db.rate_limits, client_id)
     # --- Fim Rate Limiting ---
 
     try:
