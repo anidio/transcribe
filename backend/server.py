@@ -1,14 +1,15 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Request # Adicionado Request
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from motor.core import AgnosticCollection
 import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta # Adicionado timedelta
 import re
 
 # Imports para Gemini
@@ -16,9 +17,14 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors 
+from ipware import get_client_ip # Para capturar o IP
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+# --- Variáveis de Configuração de Monetização ---
+MAX_REQUESTS_PER_HOUR = 5 
+RATE_LIMIT_DURATION_SECONDS = 3600 # 60 minutos
 
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL')
@@ -49,7 +55,6 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 # Inicializa o cliente Gemini globalmente
 try:
     if GEMINI_API_KEY:
-        # Note: A biblioteca google-genai pode usar a variável GEMINI_API_KEY do ambiente automaticamente.
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     else:
         gemini_client = None
@@ -80,6 +85,49 @@ class ProcessResult(BaseModel):
     result: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+# --- Lógica de Rate Limiting ---
+
+async def check_rate_limit(collection: AgnosticCollection, client_id: str):
+    """Verifica e atualiza o limite de requisições por IP na última hora."""
+    
+    if db is None:
+        # Se o DB estiver desligado, pulamos o limite, mas a cota da API ainda existe
+        logging.warning("DB is None. Skipping rate limit check.")
+        return
+    
+    current_time = datetime.now(timezone.utc)
+    one_hour_ago = current_time - timedelta(seconds=RATE_LIMIT_DURATION_SECONDS)
+    
+    # 1. Limpa entradas antigas (mais de uma hora)
+    await collection.delete_many({
+        "client_id": client_id,
+        "timestamp": {"$lt": one_hour_ago}
+    })
+    
+    # 2. Conta as requisições restantes
+    request_count = await collection.count_documents({
+        "client_id": client_id
+    })
+    
+    if request_count >= MAX_REQUESTS_PER_HOUR:
+        # 3. Limite excedido
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Limite de requisições ({MAX_REQUESTS_PER_HOUR}/hora) excedido. Tente novamente mais tarde para o serviço Gratuito."
+        )
+    
+    # 4. Registra a nova requisição
+    await collection.insert_one({
+        "client_id": client_id,
+        "timestamp": current_time,
+        "type": "ai_call"
+    })
+    # 5. Indexação (Opcional, mas melhora o desempenho)
+    # collection.create_index([("client_id", 1), ("timestamp", 1)], background=True)
+
+
+# --- Funções do Núcleo da Aplicação ---
+
 def extract_video_id(url: str) -> str:
     """Extract YouTube video ID from URL"""
     patterns = [
@@ -96,26 +144,36 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Invalid YouTube URL")
 
 async def get_youtube_transcript(video_id: str) -> str:
-    """Get YouTube transcript with fallback languages"""
+    """Get YouTube transcript with fallback languages and proxy support."""
+    
+    # --- NOVO: Lógica de Proxy ---
+    proxy_url = os.environ.get('TRANSCRIPTION_PROXY')
+    proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+    # --- Fim Lógica de Proxy ---
+
     try:
         api = YouTubeTranscriptApi()
         
         # Try Portuguese first, then English
         for lang_codes in [['pt'], ['en'], ['pt-BR'], ['en-US']]:
             try:
-                transcript = api.fetch(video_id, languages=lang_codes)
+                # Passa o argumento proxies para a função fetch
+                transcript = api.fetch(video_id, languages=lang_codes, proxies=proxies)
                 transcript_text = ' '.join([entry.text for entry in transcript])
                 return transcript_text
             except:
                 continue
                 
         # If no specific language works, try default (English)
-        transcript = api.fetch(video_id, languages=['en'])
+        # Passa o argumento proxies para a função fetch
+        transcript = api.fetch(video_id, languages=['en'], proxies=proxies)
         transcript_text = ' '.join([entry.text for entry in transcript])
         return transcript_text
         
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição: {str(e)}")
+        # Erro de bloqueio de IP da Cloud geralmente é capturado aqui
+        logging.error(f"Erro na transcrição (possível bloqueio de IP): {e}")
+        raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição (Bloqueio de IP da Cloud?): {str(e)}")
 
 async def process_with_ai(text: str, task: str) -> str:
     """Process text with AI using Google Generative AI (Gemini) direct client"""
@@ -215,7 +273,6 @@ async def transcribe_video(request: VideoRequest):
         )
         
         # Save to database
-        # CORREÇÃO CRÍTICA: Mudança de 'if db:' para 'if db is not None:'
         if db is not None:
             await db.videos.insert_one(video_response.dict())
         else:
@@ -231,8 +288,15 @@ async def transcribe_video(request: VideoRequest):
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 @api_router.post("/videos/summarize", response_model=ProcessResult)
-async def summarize_text(request: TranscriptRequest):
+async def summarize_text(request: TranscriptRequest, request_info: Request): # Adicionado request_info: Request
     """Summarize transcript text"""
+    
+    # --- Lógica de Rate Limiting ---
+    client_ip, _ = get_client_ip(request_info.headers)
+    if client_ip:
+        await check_rate_limit(db.rate_limits, client_ip)
+    # --- Fim Rate Limiting ---
+
     try:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
@@ -240,7 +304,6 @@ async def summarize_text(request: TranscriptRequest):
         summary = await process_with_ai(request.text, "summarize")
         
         result = ProcessResult(result=summary)
-        # CORREÇÃO CRÍTICA: Mudança de 'if db:' para 'if db is not None:'
         if db is not None:
             await db.summaries.insert_one(result.dict())
         
@@ -248,12 +311,20 @@ async def summarize_text(request: TranscriptRequest):
         
     except Exception as e:
         if isinstance(e, HTTPException):
+            # Se for um erro de Rate Limit (429), propaga
             raise e
         raise HTTPException(status_code=500, detail=f"Erro ao processar resumo: {str(e)}")
 
 @api_router.post("/videos/enrich", response_model=ProcessResult)  
-async def enrich_text(request: TranscriptRequest):
+async def enrich_text(request: TranscriptRequest, request_info: Request): # Adicionado request_info: Request
     """Enrich and enhance transcript text"""
+    
+    # --- Lógica de Rate Limiting ---
+    client_ip, _ = get_client_ip(request_info.headers)
+    if client_ip:
+        await check_rate_limit(db.rate_limits, client_ip)
+    # --- Fim Rate Limiting ---
+
     try:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
@@ -261,7 +332,6 @@ async def enrich_text(request: TranscriptRequest):
         enrichment = await process_with_ai(request.text, "enrich")
         
         result = ProcessResult(result=enrichment)
-        # CORREÇÃO CRÍTICA: Mudança de 'if db:' para 'if db is not None:'
         if db is not None:
             await db.enrichments.insert_one(result.dict())
         
@@ -269,13 +339,13 @@ async def enrich_text(request: TranscriptRequest):
         
     except Exception as e:
         if isinstance(e, HTTPException):
+            # Se for um erro de Rate Limit (429), propaga
             raise e
         raise HTTPException(status_code=500, detail=f"Erro ao processar aprimoramento: {str(e)}")
 
 @api_router.get("/videos", response_model=List[VideoResponse])
 async def get_videos():
     """Get all processed videos"""
-    # CORREÇÃO CRÍTICA: Mudança de 'if not db:' para 'if db is None:'
     if db is None:
         raise HTTPException(status_code=500, detail="Conexão com o banco de dados indisponível.")
     
