@@ -375,7 +375,7 @@ async def summarize_text(
             raise e
         raise HTTPException(status_code=500, detail=f"Erro ao processar resumo: {str(e)}")
 
-@api_router.post("/videos/enrich", response_model=ProcessResult)  
+@api_router.post("/videos/enrich", response_model=ProcessResult)
 async def enrich_text(
     request: TranscriptRequest, 
     request_info: Request,
