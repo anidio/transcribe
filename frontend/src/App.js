@@ -53,16 +53,24 @@ function App() {
   };
 
   // Função para simular a compra e salvar a chave
-  const buyProVersion = (secretKey) => {
-    // O MOCK_PRO_KEY DEVE SER IGUAL ao PRO_API_KEY no seu backend/.env
-    const MOCK_PRO_KEY = "mngBt-Pr0-2025-a1c2d3e4f5g6h7i8j9k0-z9y8x7w6v5u4"; 
+  const buyProVersion = async () => {
+    // 1. Chama o backend para criar a preferência de pagamento do Mercado Pago
+    // Não precisa de TRY/CATCH aqui, pois o handleApiCall já tem um tratamento de erro centralizado
+    
+    // NOTA: Usamos a função axios.post direta aqui, pois não queremos aplicar o Rate Limit para a rota de PAGAMENTO
+    try {
+        const response = await axios.post(`${API}/create-preference`);
+        const checkoutUrl = response.data.url;
+        
+        // 2. Redireciona o usuário para o Checkout do Mercado Pago
+        // O Mercado Pago se encarregará de levar o usuário ao seu banco e retornar para a DOMAIN_URL
+        window.location.href = checkoutUrl;
 
-    // Simulação do sucesso da compra
-    localStorage.setItem(PRO_KEY_STORAGE_NAME, MOCK_PRO_KEY);
-    setProKey(MOCK_PRO_KEY);
-    setIsUpgradeModalOpen(false);
-    toast.success("Upgrade Pro ativado! Você já pode usar ilimitadamente.");
-  };
+    } catch (error) {
+        toast.error("Erro ao iniciar o checkout do Mercado Pago. Verifique as chaves MP no Vercel.");
+        console.error("Erro no checkout:", error.response?.data?.detail || error.message);
+    }
+};
 
   // NOVO: Função centralizada para chamadas à API com o cabeçalho PRO
   const handleApiCall = async (endpoint, data, action) => {

@@ -8,7 +8,7 @@ from typing import List, Optional, Annotated
 # FastAPI / Starlette
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Header
 from starlette.middleware.cors import CORSMiddleware
-from ipware import get_client_ip # Para capturar o IP
+from ipware import get_client_ip
 
 # MongoDB
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -25,18 +25,33 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors 
 
+# Mercado Pago
+import mercadopago
+
 # --- Configuração Inicial e Variáveis de Ambiente ---
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # Variáveis de Configuração de Monetização
 MAX_REQUESTS_PER_HOUR = 5 
-RATE_LIMIT_DURATION_SECONDS = 3600 # 60 minutos
+RATE_LIMIT_DURATION_SECONDS = 3600
 
-# Chave Pro para Bypass
+# Chaves de Segurança e Pagamento (Lidas de Environment Variables no Vercel)
 PRO_API_KEY = os.environ.get('PRO_API_KEY')
+MP_ACCESS_TOKEN = os.environ.get('MP_ACCESS_TOKEN')
+MP_PRO_ID = os.environ.get('MP_PRO_ID', 'plano-pro-yt-processor') # ID do item a ser cobrado
+DOMAIN_URL = os.environ.get('DOMAIN_URL', 'http://localhost:3000') # Seu domínio real para redirecionamento
+
 if not PRO_API_KEY:
     logging.warning("PRO_API_KEY não configurada. A funcionalidade Pro não será habilitada.")
+
+# Inicializa o Mercado Pago SDK
+if MP_ACCESS_TOKEN:
+    mp_client = mercadopago.MP(MP_ACCESS_TOKEN)
+else:
+    mp_client = None
+    logging.warning("MP_ACCESS_TOKEN não configurada. Pagamentos via Mercado Pago desativados.")
+
 
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL')
@@ -94,7 +109,7 @@ class ProcessResult(BaseModel):
 async def check_rate_limit(
     collection: AgnosticCollection, 
     client_id: str,
-    pro_key_header: Optional[str] = None # Novo parâmetro para o cabeçalho
+    pro_key_header: Optional[str] = None
 ):
     """Verifica e atualiza o limite de requisições por IP na última hora, com bypass Pro."""
     
@@ -161,18 +176,17 @@ async def get_youtube_transcript(video_id: str) -> str:
     proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
 
     try:
-        # Tenta buscar PT e EN (o método 'get_transcript' é estático)
+        # Tenta buscar PT e EN
         transcript_list = YouTubeTranscriptApi.get_transcript(
             video_id, 
             languages=['pt', 'en', 'pt-BR', 'en-US'],
-            # proxies=proxies # NOTE: A lib youtube-transcript-api só aceita proxies se instalada com um fork ou versão mais antiga. Removido o argumento para não causar erro, dependendo do deploy.
+            # Argumento proxies removido para evitar erro de lib
         )
         transcript_text = ' '.join([entry['text'] for entry in transcript_list])
         return transcript_text
         
     except Exception as e:
         logging.error(f"Erro na transcrição: {e}")
-        # Erro de bloqueio de IP da Cloud ou falha no proxy
         raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição. (ID de vídeo inválido ou erro de API): {str(e)}")
 
 async def process_with_ai(text: str, task: str) -> str:
@@ -240,7 +254,6 @@ Analise o seguinte texto e crie uma versão aprimorada e enriquecida:
             )
         )
         
-        # Verifica se o conteúdo foi bloqueado
         if response.candidates and response.candidates[0].finish_reason.name == 'SAFETY':
              return "O conteúdo da transcrição foi bloqueado pelas políticas de segurança do modelo Gemini."
              
@@ -248,7 +261,6 @@ Analise o seguinte texto e crie uma versão aprimorada e enriquecida:
         
     except genai_errors.APIError as e:
         logging.error(f"Erro de API com Gemini: {e}")
-        # A API Error geralmente significa chave inválida ou erro de cota
         raise HTTPException(status_code=500, detail="Erro de API com Gemini. Verifique se a GEMINI_API_KEY é válida ou se a cota foi excedida (grátis).")
     except Exception as e:
         logging.error(f"Erro ao processar com Gemini: {e}")
@@ -265,6 +277,46 @@ api_router = APIRouter(prefix="/api")
 @api_router.get("/")
 async def root():
     return {"message": "YouTube Video AI Processor API"}
+
+# Rota para criar preferência de Checkout do Mercado Pago
+@api_router.post("/create-preference")
+async def create_preference():
+    """Cria uma preferência de pagamento no Mercado Pago e retorna a URL de redirecionamento."""
+    if not mp_client or not MP_PRO_ID:
+        raise HTTPException(status_code=500, detail="Configuração do Mercado Pago ausente. Verifique MP_ACCESS_TOKEN e MP_PRO_ID.")
+
+    # Cria um ID de referência único para rastrear o pagamento
+    external_reference = f"PRO-{uuid.uuid4()}"
+
+    preference_data = {
+        "items": [
+            {
+                "id": MP_PRO_ID,
+                "title": "Upgrade YT AI Processor PRO (Uso Ilimitado)",
+                "currency_id": "BRL",
+                "unit_price": 9.99, # Defina o preço do seu plano Pro
+                "quantity": 1,
+            }
+        ],
+        # URLs de redirecionamento
+        "back_urls": {
+            "success": DOMAIN_URL + "/?payment=success&ref=" + external_reference,
+            "failure": DOMAIN_URL + "/?payment=failure",
+            "pending": DOMAIN_URL + "/?payment=pending",
+        },
+        "auto_return": "approved",
+        "external_reference": external_reference,
+        # Adicione aqui a lógica para Webhooks se for plano recorrente
+    }
+
+    try:
+        preference = mp_client.create_preference(preference_data)
+        # O preference['response']['init_point'] é o link de checkout
+        return {"url": preference['response']['init_point']}
+    except Exception as e:
+        logging.error(f"Erro ao criar preferência de checkout no Mercado Pago: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno ao iniciar o pagamento via Mercado Pago.")
+
 
 @api_router.post("/videos/transcribe", response_model=VideoResponse)
 async def transcribe_video(request: VideoRequest):
@@ -296,14 +348,13 @@ async def transcribe_video(request: VideoRequest):
 async def summarize_text(
     request: TranscriptRequest, 
     request_info: Request,
-    x_pro_key: Annotated[Optional[str], Header(alias="X-PRO-KEY")] = None # Lê o cabeçalho PRO
+    x_pro_key: Annotated[Optional[str], Header(alias="X-PRO-KEY")] = None
 ): 
     """Summarize transcript text"""
     
     # --- Lógica de Rate Limiting ---
     client_ip, _ = get_client_ip(request_info.headers)
     if client_ip:
-        # Passa a chave PRO para check_rate_limit
         await check_rate_limit(db.rate_limits, client_ip, x_pro_key)
     # --- Fim Rate Limiting ---
 
@@ -321,7 +372,6 @@ async def summarize_text(
         
     except Exception as e:
         if isinstance(e, HTTPException):
-            # Se for um erro de Rate Limit (429), propaga
             raise e
         raise HTTPException(status_code=500, detail=f"Erro ao processar resumo: {str(e)}")
 
@@ -329,14 +379,13 @@ async def summarize_text(
 async def enrich_text(
     request: TranscriptRequest, 
     request_info: Request,
-    x_pro_key: Annotated[Optional[str], Header(alias="X-PRO-KEY")] = None # Lê o cabeçalho PRO
+    x_pro_key: Annotated[Optional[str], Header(alias="X-PRO-KEY")] = None
 ): 
     """Enrich and enhance transcript text"""
     
     # --- Lógica de Rate Limiting ---
     client_ip, _ = get_client_ip(request_info.headers)
     if client_ip:
-        # Passa a chave PRO para check_rate_limit
         await check_rate_limit(db.rate_limits, client_ip, x_pro_key)
     # --- Fim Rate Limiting ---
 
@@ -354,7 +403,6 @@ async def enrich_text(
         
     except Exception as e:
         if isinstance(e, HTTPException):
-            # Se for um erro de Rate Limit (429), propaga
             raise e
         raise HTTPException(status_code=500, detail=f"Erro ao processar aprimoramento: {str(e)}")
 
@@ -378,7 +426,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configura o logging (mantenha)
+# Configura o logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
