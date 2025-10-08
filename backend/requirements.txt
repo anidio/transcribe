@@ -121,5 +121,6 @@ websockets==15.0.1
 yarl==1.21.0
 youtube-transcript-api==1.2.2
 zipp==3.23.0
+django
 django-ipware
 gunicorn
