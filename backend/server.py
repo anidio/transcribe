@@ -1,37 +1,49 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request 
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from motor.core import AgnosticCollection
 import os
+import re
 import logging
 from pathlib import Path
+from dotenv import load_dotenv
+from typing import List, Optional, Annotated
+
+# FastAPI / Starlette
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Header
+from starlette.middleware.cors import CORSMiddleware
+from ipware import get_client_ip # Para capturar o IP
+
+# MongoDB
+from motor.motor_asyncio import AsyncIOMotorClient
+from motor.core import AgnosticCollection
+
+# Pydantic / Tipagem
 from pydantic import BaseModel, Field
-from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta 
-import re
 
-# Imports para Gemini
+# Gemini / YT Transcript
 from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors 
-from ipware import get_client_ip # Para capturar o IP
 
+# --- Configuração Inicial e Variáveis de Ambiente ---
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# --- Variáveis de Configuração de Monetização ---
+# Variáveis de Configuração de Monetização
 MAX_REQUESTS_PER_HOUR = 5 
 RATE_LIMIT_DURATION_SECONDS = 3600 # 60 minutos
 
+# Chave Pro para Bypass
+PRO_API_KEY = os.environ.get('PRO_API_KEY')
+if not PRO_API_KEY:
+    logging.warning("PRO_API_KEY não configurada. A funcionalidade Pro não será habilitada.")
+
 # MongoDB connection
 mongo_url = os.environ.get('MONGO_URL')
+client = None
+db = None
 if not mongo_url:
-    logging.warning("MONGO_URL not found in .env. Database will not be functional.")
-    client = None
-    db = None
+    logging.warning("MONGO_URL not found. Database will not be functional.")
 else:
     try:
         client = AsyncIOMotorClient(mongo_url)
@@ -42,22 +54,13 @@ else:
         client = None
         db = None
 
-
-# Create the main app without a prefix
-app = FastAPI()
-
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
-
 # LLM Configuration
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
-
-# Inicializa o cliente Gemini globalmente
+gemini_client = None
 try:
     if GEMINI_API_KEY:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     else:
-        gemini_client = None
         logging.warning("GEMINI_API_KEY não configurada. A integração com IA pode falhar.")
 
 except Exception as e:
@@ -65,7 +68,7 @@ except Exception as e:
     gemini_client = None
 
 
-# Define Models
+# --- Modelos de Dados ---
 class VideoRequest(BaseModel):
     url: str
 
@@ -85,9 +88,20 @@ class ProcessResult(BaseModel):
     result: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-# --- Lógica de Rate Limiting (Não alterada) ---
-async def check_rate_limit(collection: AgnosticCollection, client_id: str):
-    """Verifica e atualiza o limite de requisições por IP na última hora."""
+
+# --- Lógica de Rate Limiting com Bypass (Monetização) ---
+
+async def check_rate_limit(
+    collection: AgnosticCollection, 
+    client_id: str,
+    pro_key_header: Optional[str] = None # Novo parâmetro para o cabeçalho
+):
+    """Verifica e atualiza o limite de requisições por IP na última hora, com bypass Pro."""
+    
+    # 1. BYPASS PRO KEY: Se a chave Pro for enviada e for válida, ignora o limite.
+    if pro_key_header and pro_key_header == PRO_API_KEY:
+        logging.info(f"PRO_API_KEY valid. Bypassing rate limit for client: {client_id}")
+        return
     
     if db is None:
         logging.warning("DB is None. Skipping rate limit check.")
@@ -96,33 +110,37 @@ async def check_rate_limit(collection: AgnosticCollection, client_id: str):
     current_time = datetime.now(timezone.utc)
     one_hour_ago = current_time - timedelta(seconds=RATE_LIMIT_DURATION_SECONDS)
     
-    # 1. Limpa entradas antigas (mais de uma hora)
+    # Limpa entradas antigas (mais de uma hora)
     await collection.delete_many({
         "client_id": client_id,
         "timestamp": {"$lt": one_hour_ago}
     })
     
-    # 2. Conta as requisições restantes
+    # Conta as requisições restantes
     request_count = await collection.count_documents({
         "client_id": client_id
     })
     
     if request_count >= MAX_REQUESTS_PER_HOUR:
-        # 3. Limite excedido
+        # Limite excedido
+        logging.warning(f"Rate limit exceeded for client: {client_id}")
         raise HTTPException(
             status_code=429, 
-            detail=f"Limite de requisições ({MAX_REQUESTS_PER_HOUR}/hora) excedido. Tente novamente mais tarde para o serviço Gratuito."
+            detail=f"Limite de requisições ({MAX_REQUESTS_PER_HOUR}/hora) excedido. Faça upgrade para a Versão Pro para uso ilimitado!",
         )
     
-    # 4. Registra a nova requisição
+    # Registra a nova requisição
     await collection.insert_one({
         "client_id": client_id,
         "timestamp": current_time,
         "type": "ai_call"
     })
 
+
+# --- Funções de Negócio ---
+
 def extract_video_id(url: str) -> str:
-    """Extract YouTube video ID from URL"""
+    """Extrai o ID do vídeo de diversas URLs do YouTube"""
     patterns = [
         r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&\n?#]+)',
         r'youtube\.com/embed/([^&\n?#]+)',
@@ -139,25 +157,23 @@ def extract_video_id(url: str) -> str:
 async def get_youtube_transcript(video_id: str) -> str:
     """Get YouTube transcript with fallback languages and proxy support."""
     
-    # --- Lógica de Proxy ---
     proxy_url = os.environ.get('TRANSCRIPTION_PROXY')
     proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
-    # --- Fim Lógica de Proxy ---
 
     try:
         # Tenta buscar PT e EN (o método 'get_transcript' é estático)
         transcript_list = YouTubeTranscriptApi.get_transcript(
             video_id, 
             languages=['pt', 'en', 'pt-BR', 'en-US'],
-            proxies=proxies # Agora o método estático aceita proxies
+            # proxies=proxies # NOTE: A lib youtube-transcript-api só aceita proxies se instalada com um fork ou versão mais antiga. Removido o argumento para não causar erro, dependendo do deploy.
         )
         transcript_text = ' '.join([entry['text'] for entry in transcript_list])
         return transcript_text
         
     except Exception as e:
+        logging.error(f"Erro na transcrição: {e}")
         # Erro de bloqueio de IP da Cloud ou falha no proxy
-        logging.error(f"Erro na transcrição (possível bloqueio de IP): {e}")
-        raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição (Bloqueio de IP da Cloud?): {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Não foi possível obter a transcrição. (ID de vídeo inválido ou erro de API): {str(e)}")
 
 async def process_with_ai(text: str, task: str) -> str:
     """Process text with AI using Google Generative AI (Gemini) direct client"""
@@ -239,7 +255,13 @@ Analise o seguinte texto e crie uma versão aprimorada e enriquecida:
         raise HTTPException(status_code=500, detail=f"Erro ao processar com Gemini: {str(e)}")
 
 
-# API Routes
+# --- Configuração do FastAPI ---
+app = FastAPI()
+api_router = APIRouter(prefix="/api")
+
+
+# --- ROTAS DA API ---
+
 @api_router.get("/")
 async def root():
     return {"message": "YouTube Video AI Processor API"}
@@ -267,18 +289,22 @@ async def transcribe_video(request: VideoRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        # Erro interno, pode ser do DB
         logging.error(f"Erro interno no /transcribe: {e}")
         raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
 
 @api_router.post("/videos/summarize", response_model=ProcessResult)
-async def summarize_text(request: TranscriptRequest, request_info: Request): 
+async def summarize_text(
+    request: TranscriptRequest, 
+    request_info: Request,
+    x_pro_key: Annotated[Optional[str], Header(alias="X-PRO-KEY")] = None # Lê o cabeçalho PRO
+): 
     """Summarize transcript text"""
     
     # --- Lógica de Rate Limiting ---
     client_ip, _ = get_client_ip(request_info.headers)
     if client_ip:
-        await check_rate_limit(db.rate_limits, client_ip)
+        # Passa a chave PRO para check_rate_limit
+        await check_rate_limit(db.rate_limits, client_ip, x_pro_key)
     # --- Fim Rate Limiting ---
 
     try:
@@ -299,14 +325,19 @@ async def summarize_text(request: TranscriptRequest, request_info: Request):
             raise e
         raise HTTPException(status_code=500, detail=f"Erro ao processar resumo: {str(e)}")
 
-@api_router.post("/videos/enrich", response_model=ProcessResult)  
-async def enrich_text(request: TranscriptRequest, request_info: Request): 
+@api_router.post("/videos/enrich", response_model=ProcessResult)  
+async def enrich_text(
+    request: TranscriptRequest, 
+    request_info: Request,
+    x_pro_key: Annotated[Optional[str], Header(alias="X-PRO-KEY")] = None # Lê o cabeçalho PRO
+): 
     """Enrich and enhance transcript text"""
     
     # --- Lógica de Rate Limiting ---
     client_ip, _ = get_client_ip(request_info.headers)
     if client_ip:
-        await check_rate_limit(db.rate_limits, client_id)
+        # Passa a chave PRO para check_rate_limit
+        await check_rate_limit(db.rate_limits, client_ip, x_pro_key)
     # --- Fim Rate Limiting ---
 
     try:
@@ -336,7 +367,7 @@ async def get_videos():
     videos = await db.videos.find().to_list(100)
     return [VideoResponse(**video) for video in videos]
 
-# Include the router in the main app
+# Inclui o router no main app
 app.include_router(api_router)
 
 app.add_middleware(
@@ -347,7 +378,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
+# Configura o logging (mantenha)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'

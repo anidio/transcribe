@@ -1,16 +1,18 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import "./App.css";
 import axios from "axios";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Badge } from "./components/ui/badge";
-import { Loader2, Youtube, Sparkles, FileText, Zap, Instagram } from "lucide-react";
+import { Loader2, Youtube, Sparkles, FileText, Zap } from "lucide-react";
 import { toast } from "sonner";
 import Footer from "./components/ui/Footer.jsx";
+import UpgradeDialog from "./components/ui/UpgradeDialog.jsx"; 
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
+const PRO_KEY_STORAGE_NAME = "yt-ai-pro-key"; // Nome da chave no localStorage
 
 function App() {
   const [url, setUrl] = useState("");
@@ -22,9 +24,71 @@ function App() {
     summarize: false,
     enrich: false
   });
+  const [isUpgradeModalOpen, setIsUpgradeModalOpen] = useState(false);
+  // NOVO ESTADO: Armazena a chave PRO
+  const [proKey, setProKey] = useState(null);
+
+  // Efeito 1: Carrega a chave PRO do localStorage ao iniciar
+  useEffect(() => {
+    const storedKey = localStorage.getItem(PRO_KEY_STORAGE_NAME);
+    if (storedKey) {
+      setProKey(storedKey);
+    }
+  }, []);
+
+  // Efeito 2: Inicializa os blocos do AdSense após a renderização ou mudança de conteúdo
+  useEffect(() => {
+    // Tenta carregar o AdSense globalmente, se ele existir
+    if (window.adsbygoogle && process.env.NODE_ENV === 'production') {
+        try {
+            (window.adsbygoogle = window.adsbygoogle || []).push({});
+        } catch (error) {
+            console.error("AdSense push failed:", error);
+        }
+    }
+  }, [transcript, summary, enrichment]); // Re-renderiza ads quando novos conteúdos aparecem
 
   const setLoadingState = (action, state) => {
     setLoading(prev => ({ ...prev, [action]: state }));
+  };
+
+  // Função para simular a compra e salvar a chave
+  const buyProVersion = (secretKey) => {
+    // O MOCK_PRO_KEY DEVE SER IGUAL ao PRO_API_KEY no seu backend/.env
+    const MOCK_PRO_KEY = "mngBt-Pr0-2025-a1c2d3e4f5g6h7i8j9k0-z9y8x7w6v5u4"; 
+
+    // Simulação do sucesso da compra
+    localStorage.setItem(PRO_KEY_STORAGE_NAME, MOCK_PRO_KEY);
+    setProKey(MOCK_PRO_KEY);
+    setIsUpgradeModalOpen(false);
+    toast.success("Upgrade Pro ativado! Você já pode usar ilimitadamente.");
+  };
+
+  // NOVO: Função centralizada para chamadas à API com o cabeçalho PRO
+  const handleApiCall = async (endpoint, data, action) => {
+    setLoadingState(action, true);
+
+    const headers = {};
+    if (proKey) {
+        headers['X-PRO-KEY'] = proKey; // Adiciona o cabeçalho PRO para bypass
+    }
+
+    try {
+        const response = await axios.post(`${API}${endpoint}`, data, { headers });
+        return response.data;
+    } catch (error) {
+        // Tratamento do limite de requisições (429)
+        if (error.response?.status === 429) {
+            setIsUpgradeModalOpen(true);
+            toast.error(error.response?.data?.detail || "Limite de uso excedido. Faça upgrade!");
+        } else {
+            // Erro geral
+            toast.error(error.response?.data?.detail || `Erro ao executar ${action}`);
+        }
+        throw error; // Propaga o erro
+    } finally {
+        setLoadingState(action, false);
+    }
   };
 
   const handleTranscribe = async () => {
@@ -33,19 +97,15 @@ function App() {
       return;
     }
 
-    setLoadingState('transcribe', true);
     setSummary("");
     setEnrichment("");
 
     try {
-      const response = await axios.post(`${API}/videos/transcribe`, { url });
-      setTranscript(response.data.transcript);
+      const data = await handleApiCall("/videos/transcribe", { url }, 'transcribe');
+      setTranscript(data.transcript);
       toast.success("Transcrição concluída com sucesso!");
     } catch (error) {
-      console.error("Erro na transcrição:", error);
-      toast.error(error.response?.data?.detail || "Erro ao transcrever vídeo");
-    } finally {
-      setLoadingState('transcribe', false);
+      // O tratamento de erro está em handleApiCall, apenas ignoramos o erro aqui
     }
   };
 
@@ -55,17 +115,12 @@ function App() {
       return;
     }
 
-    setLoadingState('summarize', true);
-
     try {
-      const response = await axios.post(`${API}/videos/summarize`, { text: transcript });
-      setSummary(response.data.result);
+      const data = await handleApiCall("/videos/summarize", { text: transcript }, 'summarize');
+      setSummary(data.result);
       toast.success("Resumo gerado com sucesso!");
     } catch (error) {
-      console.error("Erro no resumo:", error);
-      toast.error(error.response?.data?.detail || "Erro ao gerar resumo");
-    } finally {
-      setLoadingState('summarize', false);
+      // O tratamento de erro está em handleApiCall, apenas ignoramos o erro aqui
     }
   };
 
@@ -75,25 +130,18 @@ function App() {
       return;
     }
 
-    setLoadingState('enrich', true);
-
     try {
-      const response = await axios.post(`${API}/videos/enrich`, { text: transcript });
-      setEnrichment(response.data.result);
+      const data = await handleApiCall("/videos/enrich", { text: transcript }, 'enrich');
+      setEnrichment(data.result);
       toast.success("Conteúdo aprimorado com sucesso!");
     } catch (error) {
-      console.error("Erro no aprimoramento:", error);
-      toast.error(error.response?.data?.detail || "Erro ao aprimorar conteúdo");
-    } finally {
-      setLoadingState('enrich', false);
+      // O tratamento de erro está em handleApiCall, apenas ignoramos o erro aqui
     }
   };
 
   const formatMarkdown = (text) => {
     if (!text) return "";
     
-    // NOTA: Esta função só é usada nas áreas de resultado (Summary/Enrichment)
-    // As tags Markdown continuam sendo usadas aqui para formatar o texto da IA
     return text
       .replace(/## (.*)/g, '<h2 class="text-xl font-bold text-cyan-400 mb-3 mt-6">$1</h2>')
       .replace(/### (.*)/g, '<h3 class="text-lg font-semibold text-pink-400 mb-2 mt-4">$1</h3>')
@@ -105,6 +153,10 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900/20 to-gray-900">
+      
+      {/* Paywall Dialog - Passa a função buyProVersion */}
+      <UpgradeDialog isOpen={isUpgradeModalOpen} onClose={() => setIsUpgradeModalOpen(false)} onUpgrade={buyProVersion} />
+
       {/* Background Effects */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl animate-pulse"></div>
@@ -123,7 +175,7 @@ function App() {
             </h1>
           </div>
           
-          {/* Parágrafo de SEO Otimizado (AGORA USANDO TAGS <strong> DIRETAMENTE) */}
+          {/* Parágrafo de SEO Otimizado */}
           <p className="text-xl text-gray-300 max-w-2xl mx-auto">
             Transforme vídeos do YouTube em conteúdo estruturado com IA avançada. Use nossa ferramenta 
             <strong className="text-cyan-400"> Grátis</strong> para <strong className="text-pink-400">Transcrever</strong>, 
@@ -168,6 +220,18 @@ function App() {
             </CardContent>
           </Card>
 
+          {/* AD BLOCK 1: BANNER PRINCIPAL (Horizontal) */}
+          <div data-testid="ad-placement-top" className="w-full h-auto min-h-20 bg-gray-800/70 p-1 rounded-xl border border-pink-500/30 shadow-xl text-center flex items-center justify-center">
+            <ins className="adsbygoogle"
+                style={{ display: 'block', width: '100%', height: '100%', minHeight: '90px' }}
+                data-ad-client="ca-pub-SEU_PUBLISHER_ID"
+                data-ad-slot="2693883691" 
+                data-ad-format="auto"
+                data-full-width-responsive="true"
+                dangerouslySetInnerHTML={{ __html: '' }} 
+            />
+          </div>
+
           {/* Action Buttons */}
           {transcript && (
             <div className="flex flex-col sm:flex-row gap-4 justify-center">
@@ -203,6 +267,20 @@ function App() {
 
           {/* Results Grid */}
           <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+            
+            {/* AD BLOCK 2: CARD/SIDEBAR (Retangular) */}
+            <div data-testid="ad-placement-sidebar" className={`w-full h-auto min-h-48 bg-gray-800/70 p-1 rounded-xl border border-cyan-500/30 shadow-xl text-center flex items-center justify-center 
+              ${!transcript && 'lg:col-span-3 xl:col-span-3'} 
+              ${transcript && !summary && !enrichment && 'lg:col-span-2 xl:col-span-2'}`}>
+                <ins className="adsbygoogle"
+                    style={{ display: 'block', width: '100%', height: '100%', minHeight: '250px' }}
+                    data-ad-client="ca-pub-SEU_PUBLISHER_ID"
+                    data-ad-slot="9653317366"
+                    data-ad-format="rectangle"
+                    dangerouslySetInnerHTML={{ __html: '' }} 
+                />
+            </div>
+
             {/* Transcript */}
             {transcript && (
               <Card data-testid="transcript-card" className="bg-gray-900/50 backdrop-blur-sm border-gray-700/50">
@@ -274,16 +352,25 @@ function App() {
             )}
           </div>
 
-          {/* Status Info */}
+          {/* Status Info / CTA Otimizado para SEO/Branding */}
           <div className="text-center mt-8">
             <p className="text-gray-400 text-sm">
-              Powered by Gemini 2.5 Flash • GPT-4o • Claude 3.5 Sonnet
+              <span className="text-white font-semibold mr-1">Potencializado por IA.</span> 
+              Precisa de uma ferramenta como essa?
+              <a 
+                href="[LINK DO SEU SITE DE DESENVOLVIMENTO DE SOFTWARE]" 
+                target="_blank" 
+                rel="noopener noreferrer" 
+                className="text-cyan-400 font-bold hover:text-pink-400 transition-colors duration-200 ml-1"
+              >
+                Fale com a MangueBit Code sobre desenvolvimento de software.
+              </a>
             </p>
           </div>
         </div>
       </div>
       
-      {/* NOVO: Componente Footer Inserido aqui */}
+      {/* Footer */}
       <Footer /> 
 
     </div>
